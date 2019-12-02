@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Template to provision ELB EC2 instance and S3 Bucket'
+
+Parameters:
+  VpcId:
+    Description: The VPC to deploy into.
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-71680515
+
+  AvailabilityZone:
+    Description: The name of the region the instance reside
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: ap-southeast-1a
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t1.micro
+    AllowedValues:
+    - t1.micro
+    - t3.nano
+    - t3.micro
+    - t3.small
+    - t3.medium
+    - t3.large
+    ConstraintDescription: must be a valid EC2 instance type.
+
+  SubnetId:
+    Default: subnet-de1d40a8
+    Type: String
+
+Resources:
+  SSMManagedInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref SSMManagedInstanceRole
+
+  ELBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to client host
+      VpcId:
+         Ref: VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to client host
+      VpcId:
+         Ref: VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId: !GetAtt ELBSecurityGroup.GroupId
+
+  ELB:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      AvailabilityZones:
+        - Ref : AvailabilityZone
+      Instances:
+      - Ref: WebServerInstance
+      Listeners:
+      - LoadBalancerPort: '80'
+        InstancePort: '80'
+        Protocol: HTTP
+      HealthCheck:
+        Target: HTTP:80/
+        HealthyThreshold: '2'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+      SecurityGroups:
+        - Ref : ELBSecurityGroup
+
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - "config1"
+            - "config2"
+        config1:
+          commands:
+            1_pvcreate:
+              command: pvcreate /dev/sdf
+            2_vgcreate:
+              command: vgcreate vg0 /dev/sdf
+            3_lvcreate:
+              command: lvcreate -l 100%FREE -n webserver vg0
+            4_mkfs:
+              command: mkfs.ext4 /dev/vg0/webserver
+            5_mkdir:
+              command: mkdir -p /var/www/html
+            6_fstab:
+              command: echo "/dev/mapper/vg0-webserver /var/www/html ext4 defaults 0 2" >> /etc/fstab
+            7_mount:
+              command: mount -a
+        config2:
+          files:
+            /var/www/html/index.html:
+              content: !Sub |
+                <!doctype html>
+                <html>
+                <head>
+                <title>Hello AWS World</title>
+                </head>
+                <body>
+                <p>Hello <strong>AWS</strong> World</p>
+                <p>Screen shot 1</p>
+                <img src="http://${WebServerS3Bucket.DomainName}/screen-shot1.png" alt="Screen Shot1"></p>
+                <p>Screen shot 2</p>
+                <img src="http://${WebServerS3Bucket.DomainName}/screen-shot2.png" alt="Screen Shot2"></p>
+                <p>Screen shot 3</p>
+                <img src="http://${WebServerS3Bucket.DomainName}/screen-shot3.png" alt="Screen Shot3"></p>
+                </body>
+                </html>
+              mode: "000644"
+              owner: "apache"
+              group: "apache"
+    Properties:
+      IamInstanceProfile: !Ref WebServerInstanceProfile
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !GetAtt WebServerSecurityGroup.GroupId
+      BlockDeviceMappings:
+        -
+          DeviceName: "/dev/sdf"
+          Ebs:
+            VolumeSize: 1
+            VolumeType: gp2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install httpd -y
+          systemctl enable amazon-ssm-agent httpd
+          systemctl start amazon-ssm-agent httpd
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServerInstance --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal --exit-code $? --stack ${AWS::StackName} --resource WebServerInstance --region ${AWS::Region}
+
+  WebServerS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: PublicRead
+
+Outputs:
+  ELBURL:
+      Value: !GetAtt ELB.DNSName
+      Description: URL for created ELB
